@@ -1,0 +1,378 @@
+import vk_api
+from vkbottle.bot import Bot, Message
+from vkbottle import Keyboard, Callback, CtxStorage
+from vkbottle.dispatch.rules import ABCRule
+from vkbottle.modules import logger
+import mariadb
+import sys
+import re
+import asyncio
+import time
+import json
+import os
+import datetime
+
+VK_TOKEN = 'vk1.a.SxGWsaqxEUL1iku-YhlTfev86eJvVcIdKZxJO9qVf9sVkDpO0DM-3CxMoLW23rMx6zaLePEt4InF1HcG5JPq0Cwwcr_Q7Lb4NzzPAzRKLTS97xz2MYypPTNeU7uzxSOkPIpCyAYABI5Y7_aXAKItRBgTuTZA6OIlwI0_D7CfgVmZyEgdFVmDw-H63mYRUfXpKziMMhBoHLsv_vLFQPuYcw'
+GROUP_ID = 'club236839553'
+
+DB_CONFIG = {
+    'host': '127.0.0.1',
+    'user': 'gs24054',
+    'password': '7t6-gbz-gri-cme',
+    'database': 'gs24054'
+}
+
+CONFIG_FILE = 'config.json'
+CONFIG = {}
+DEVELOPER_IDS = [553227510, 425762738]
+bot = Bot(token=VK_TOKEN)
+
+class StartsWithRule(ABCRule[Message]):
+    def __init__(self, command: str):
+        self.command = command.lower()
+
+    async def check(self, event: Message) -> bool:
+        return event.text.lower().startswith(self.command)
+
+def get_help_text(user_id, detailed=False):
+    if not detailed:
+        text = "СПИСОК КОМАНД БОТА\n\n"
+        text += "📘 Общие команды:\n"
+        text += "▪ /acadmin [ник] — Проверить, является ли игрок админом.\n"
+        text += "▪ /help — Показать это сообщение.\n"
+        if has_permission(user_id):
+            text += "\n👑 Команды для администраторов:\n"
+            text += "▪ /setadmin [ник] [уровень] — Установить админ-уровень.\n"
+            text += "▪ /awarn [ник] [+/-число] — Изменить кол-во админ-варнов.\n"
+            text += "▪ /prefix [ник] [префикс] — Установить префикс.\n"
+            text += "▪ /alog [ник/ID] ... — Поиск по логам администратора.\n"
+            text += "▪ /sync — Принудительная синхронизация ников.\n"
+            text += "▪ /set_sync_chat — Назначить чат для синхронизации.\n"
+            text += "▪ /set_notify_chat — Назначить чат для уведомлений.\n"
+            text += "▪ /show_config — Показать текущие настройки чатов.\n"
+        if is_developer(user_id):
+            text += "\n🛠 Команды для разработчиков:\n"
+            text += "▪ /grant_access — Выдать доступ к боту.\n"
+            text += "▪ /revoke_access — Забрать доступ к боту.\n"
+            text += "▪ /access_list — Показать список с доступом.\n"
+        return text
+    else:
+        text = "ПОДРОБНОЕ ОПИСАНИЕ КОМАНД\n\n"
+        text += "📘 Общие команды:\n"
+        text += "▪ /acadmin Nick_Name\n"
+        text += "   ▹ Проверяет, есть ли у игрока админ-права (уровень 1 и выше) в базе данных.\n\n"
+        if has_permission(user_id):
+            text += "👑 Команды для администраторов:\n"
+            text += "▪ /alog [админ] [цель/self]\n"
+            text += "   ▹ Поиск по логам. /alog Nick - все логи. /alog Nick self - действия на себя. /alog Admin1 Admin2 - взаимодействие.\n\n"
+            text += "▪ /setadmin Nick_Name 5\n"
+            text += "   ▹ Устанавливает игроку Nick_Name админ-уровень 5.\n\n"
+            text += "▪ /awarn Nick_Name +1 (или -1)\n"
+            text += "   ▹ Добавляет (+1) или снимает (-1) один админ-варн игроку Nick_Name.\n\n"
+            text += "▪ /prefix Nick_Name [New Prefix]\n"
+            text += "   ▹ Устанавливает игроку Nick_Name новый префикс.\n\n"
+            text += "▪ /sync\n"
+            text += "   ▹ Запускает немедленную проверку админов из БД и ников из чата ВК.\n\n"
+            text += "▪ /set_sync_chat и /set_notify_chat\n"
+            text += "   ▹ Назначить текущий чат для синхронизации или уведомлений.\n\n"
+        if is_developer(user_id):
+            text += "🛠 Команды для разработчиков:\n"
+            text += "▪ /grant_access и /revoke_access\n"
+            text += "   ▹ Написать команду, ответив на сообщение пользователя, или упомянув его через @. Выдаёт/забирает права на админ-команды бота.\n\n"
+            text += "▪ /access_list\n"
+            text += "   ▹ Показывает, кто из пользователей ВК имеет доступ к боту.\n"
+        return text
+
+def is_developer(user_id): return user_id in DEVELOPER_IDS
+def has_permission(user_id): return is_developer(user_id) or user_id in CONFIG.get('access_list', [])
+def load_config():
+    global CONFIG
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f: CONFIG = json.load(f)
+    else: CONFIG = {'target_chat_id': 0, 'notification_chat_id': 0}
+    if 'access_list' not in CONFIG: CONFIG['access_list'] = []
+    save_config()
+def save_config():
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f: json.dump(CONFIG, f, indent=4, ensure_ascii=False)
+def get_db_connection():
+    try: return mariadb.connect(**DB_CONFIG)
+    except mariadb.Error: return None
+def db_request(func, *args, **kwargs):
+    return asyncio.get_event_loop().run_in_executor(None, func, *args, **kwargs)
+
+def _set_admin_level(nickname, admin_level):
+    conn, msg = get_db_connection(), "Не удалось подключиться к БД."
+    if not conn: return msg
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE accounts SET admin = ? WHERE name = ?", (admin_level, nickname))
+        msg = f"❌ Игрок '{nickname}' не найден." if cur.rowcount == 0 else f"✅ Админ-уровень игрока '{nickname}' изменен на {admin_level}."
+        if cur.rowcount > 0: conn.commit()
+    except mariadb.Error as err: msg = f"Ошибка БД: {err}"
+    finally: conn.close()
+    return msg
+def _check_admin_status(nickname):
+    conn, msg = get_db_connection(), "Не удалось подключиться к БД."
+    if not conn: return msg
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT admin FROM accounts WHERE name = ?", (nickname,))
+        res = cur.fetchone()
+        if not res: msg = f"❌ Игрок '{nickname}' не найден."
+        else: msg = f"✅ Да, {nickname} является админом (ур: {res[0]})." if res[0] >= 1 else f"❌ Нет, {nickname} не админ (ур: {res[0]})."
+    except mariadb.Error as err: msg = f"Ошибка БД: {err}"
+    finally: conn.close()
+    return msg
+def _manage_admin_warn(nickname, change_amount):
+    conn, msg = get_db_connection(), "Не удалось подключиться к БД."
+    if not conn: return msg
+    try:
+        conn.autocommit = False
+        cursor = conn.cursor()
+        cursor.execute("SELECT admin_warn FROM accounts WHERE name = ? FOR UPDATE", (nickname,))
+        result = cursor.fetchone()
+        if result is None: msg = f"❌ Игрок '{nickname}' не найден."
+        else:
+            current_warns = result[0]
+            new_warns = max(0, current_warns + change_amount)
+            cursor.execute("UPDATE accounts SET admin_warn = ? WHERE name = ?", (new_warns, nickname))
+            conn.commit()
+            msg = f"✅ Варны администратора {nickname} изменены.\nБыло: {current_warns}, Стало: {new_warns}."
+    except mariadb.Error as err: conn.rollback(); msg = f"Ошибка БД: {err}"
+    finally: conn.autocommit = True; conn.close()
+    return msg
+def _set_prefix(nickname, new_prefix):
+    conn, msg = get_db_connection(), "Не удалось подключиться к БД."
+    if not conn: return msg
+    if len(new_prefix.encode('cp1251', errors='ignore')) > 15: return f"❌ Ошибка: Префикс слишком длинный."
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE accounts SET prefix = ? WHERE name = ?", (new_prefix, nickname))
+        msg = f"❌ Игрок '{nickname}' не найден." if cur.rowcount == 0 else f"✅ Префикс для '{nickname}' изменен на: {new_prefix}"
+        if cur.rowcount > 0: conn.commit()
+    except mariadb.Error as err: msg = f"Ошибка БД: {err}"
+    finally: conn.close()
+    return msg
+def _get_account_info(identifier):
+    query = "SELECT id, name FROM accounts WHERE id = ?" if identifier.isdigit() else "SELECT id, name FROM accounts WHERE name = ?"
+    params = (int(identifier),) if identifier.isdigit() else (identifier,)
+    conn = get_db_connection()
+    if not conn: return None
+    try: cur = conn.cursor(); cur.execute(query, params); return cur.fetchone()
+    finally: conn.close()
+def _get_admin_logs(actor_id, target_id=None):
+    conn = get_db_connection()
+    if not conn: return "Не удалось подключиться к БД."
+    query, params = "SELECT description, time FROM action_log WHERE acc_id = ? ", [actor_id]
+    if target_id is not None:
+        query += "AND description LIKE ? "
+        params.append(f"%[acc:{target_id}]%")
+    query += "ORDER BY time DESC LIMIT 15"
+    try:
+        cur = conn.cursor(); cur.execute(query, tuple(params)); logs = cur.fetchall()
+        if not logs: return "Логи для указанных критериев не найдены."
+        return "\n".join([f"[{datetime.datetime.fromtimestamp(ts).strftime('%d.%m.%Y %H:%M:%S')}] {desc}" for desc, ts in logs])
+    except mariadb.Error as err: return f"Ошибка БД: {err}"
+    finally: conn.close()
+def _get_all_db_admins():
+    conn = get_db_connection()
+    if not conn: return []
+    try: cur = conn.cursor(); cur.execute("SELECT name FROM accounts WHERE admin >= 1"); return [r[0] for r in cur.fetchall()]
+    finally: conn.close()
+def parse_nicknames_from_message(text): return re.findall(r'—\s*(\w+)', text)
+async def process_and_notify(parsed_nicks):
+    nid = CONFIG.get('notification_chat_id', 0)
+    if not nid: return
+    db_admins = await db_request(_get_all_db_admins)
+    parsed_nicks_lower = [n.lower() for n in parsed_nicks]
+    missing = [a for a in db_admins if a.lower() not in parsed_nicks_lower]
+    msg = "✅ Синхронизация завершена." if not missing else "⚠️ Внимание! Админы из БД, не найденные в ВК:\n" + "\n".join(f"{i}. {a}" for i, a in enumerate(missing, 1))
+    await bot.api.messages.send(peer_id=nid, message=msg, random_id=0)
+async def hourly_sync_task():
+    logger.info("Hourly sync task started.")
+    while True:
+        await asyncio.sleep(3600)
+        tid = CONFIG.get('target_chat_id', 0)
+        if tid:
+            try: await bot.api.messages.send(peer_id=tid, message="/nlist", random_id=0)
+            except Exception as e: logger.error(f"Error in hourly sync: {e}")
+def get_target_id_from_message(message: Message):
+    if message.reply_message: return message.reply_message.from_id
+    if message.fwd_messages: return message.fwd_messages[0].from_id
+    match = re.search(r"\[id(\d+)\|.+\]", message.text)
+    return int(match.group(1)) if match else None
+
+@bot.on.raw_event("message_event", dataclass=dict)
+async def handle_message_event(event: dict):
+    if event["object"]["payload"].get("command") == "detailed_help":
+        await bot.api.messages.edit(
+            peer_id=event["object"]["peer_id"],
+            conversation_message_id=event["object"]["conversation_message_id"],
+            message=get_help_text(event["object"]["user_id"], detailed=True),
+            keyboard=Keyboard().get_json()
+        )
+
+@bot.on.message(text=["/help", "/помощь"])
+async def help_handler(message: Message):
+    keyboard = Keyboard(inline=True).add(Callback("Для непонятных", payload={"command": "detailed_help"}))
+    await message.answer(get_help_text(message.from_id), keyboard=keyboard)
+
+@bot.on.message(text="/acadmin <nickname>")
+async def acadmin_handler(message: Message, nickname: str):
+    response = await db_request(_check_admin_status, nickname)
+    await message.answer(response)
+
+async def check_permissions(message: Message) -> bool:
+    if not has_permission(message.from_id):
+        await message.answer("❌ У вас недостаточно прав для выполнения этой команды.")
+        return False
+    return True
+
+@bot.on.message(text="/setadmin <nickname> <level:int>")
+async def setadmin_handler(message: Message, nickname: str, level: int):
+    if not await check_permissions(message): return
+    response = await db_request(_set_admin_level, nickname, level)
+    await message.answer(response)
+
+@bot.on.message(text="/awarn <nickname> <amount>")
+async def awarn_handler(message: Message, nickname: str, amount: str):
+    if not await check_permissions(message): return
+    if (amount.startswith(('+', '-'))) and amount[1:].isdigit():
+        response = await db_request(_manage_admin_warn, nickname, int(amount))
+    else:
+        response = "❌ Формат: /awarn ник +/-количество"
+    await message.answer(response)
+
+@bot.on.message(StartsWithRule("/prefix"))
+async def prefix_handler(message: Message):
+    if not await check_permissions(message): return
+    parts = message.text.split()
+    if len(parts) < 3:
+        return await message.answer("❌ Формат: /prefix ник префикс")
+    nickname = parts[1]
+    prefix_text = " ".join(parts[2:])
+    response = await db_request(_set_prefix, nickname, prefix_text)
+    await message.answer(response)
+
+@bot.on.message(StartsWithRule("/alog"))
+async def alog_handler(message: Message):
+    if not await check_permissions(message): return
+    parts = message.text.split()
+    if len(parts) < 2:
+        return await message.answer("❌ Формат: /alog [ник/ID актора] [ник/ID цели | self]")
+        
+    actor_identifier = parts[1]
+    actor_info = await db_request(_get_account_info, actor_identifier)
+    
+    actor_id, actor_name = None, None
+    if actor_info:
+        actor_id, actor_name = actor_info
+    elif actor_identifier.isdigit():
+        actor_id = int(actor_identifier)
+        actor_name = f"Удаленный аккаунт"
+    else:
+        return await message.answer(f"❌ Администратор (актор) с ником '{actor_identifier}' не найден.")
+
+    target_id = None
+    header = f"📋 Все логи для {actor_name}[{actor_id}]:\n\n"
+    
+    if len(parts) > 2:
+        target_identifier = parts[2]
+        if target_identifier.lower() == 'self':
+            target_id = actor_id
+            header = f"📋 Логи действий {actor_name}[{actor_id}] на самого себя:\n\n"
+        else:
+            target_info = await db_request(_get_account_info, target_identifier)
+            if not target_info:
+                if target_identifier.isdigit():
+                    target_id = int(target_identifier)
+                    target_name = "Удаленный/несуществующий аккаунт"
+                else:
+                    return await message.answer(f"❌ Целевой игрок '{target_identifier}' не найден.")
+            else:
+                target_id, target_name = target_info
+            header = f"📋 Логи {actor_name}[{actor_id}] для {target_name}[{target_id}]:\n\n"
+    
+    response_logs = await db_request(_get_admin_logs, actor_id, target_id)
+    await message.answer(header + response_logs)
+
+@bot.on.message(text="/sync")
+async def sync_handler(message: Message):
+    if not await check_permissions(message): return
+    tid = CONFIG.get('target_chat_id', 0)
+    if not tid: return await message.answer("❌ Sync-чат не настроен.")
+    await message.answer("Отправляю /nlist...")
+    await bot.api.messages.send(peer_id=tid, message="/nlist", random_id=0)
+
+@bot.on.message(text="/set_sync_chat")
+async def set_sync_chat_handler(message: Message):
+    if not await check_permissions(message): return
+    CONFIG['target_chat_id'] = message.peer_id
+    save_config()
+    await message.answer("✅ Этот чат назначен для отправки /nlist.")
+
+@bot.on.message(text="/set_notify_chat")
+async def set_notify_chat_handler(message: Message):
+    if not await check_permissions(message): return
+    CONFIG['notification_chat_id'] = message.peer_id
+    save_config()
+    await message.answer("✅ Сюда будут приходить уведомления.")
+
+@bot.on.message(text="/show_config")
+async def show_config_handler(message: Message):
+    if not await check_permissions(message): return
+    sync, notify = CONFIG.get('target_chat_id', 0), CONFIG.get('notification_chat_id', 0)
+    await message.answer(f"Настройки:\nSync-чат: {sync or 'Не задан'}\nNotify-чат: {notify or 'Не задан'}")
+
+async def check_developer(message: Message) -> bool:
+    if not is_developer(message.from_id):
+        await message.answer("❌ У вас недостаточно прав для выполнения этой команды.")
+        return False
+    return True
+
+@bot.on.message(text="/grant_access")
+async def grant_access_handler(message: Message):
+    if not await check_developer(message): return
+    target_id = get_target_id_from_message(message)
+    if not target_id: return await message.answer("❌ Укажите пользователя (ответом или @упоминанием).")
+    if target_id in CONFIG['access_list']: return await message.answer(f"✅ Пользователь [id{target_id}|уже] имеет доступ.")
+    CONFIG['access_list'].append(target_id); save_config()
+    await message.answer(f"✅ Доступ для [id{target_id}|пользователя] выдан.")
+
+@bot.on.message(text="/revoke_access")
+async def revoke_access_handler(message: Message):
+    if not await check_developer(message): return
+    target_id = get_target_id_from_message(message)
+    if not target_id: return await message.answer("❌ Укажите пользователя.")
+    if is_developer(target_id): return await message.answer("❌ Нельзя отозвать права у разработчика.")
+    if target_id not in CONFIG['access_list']: return await message.answer(f"❌ У пользователя [id{target_id}|уже] нет доступа.")
+    CONFIG['access_list'].remove(target_id); save_config()
+    await message.answer(f"✅ Доступ для [id{target_id}|пользователя] отозван.")
+
+@bot.on.message(text="/access_list")
+async def access_list_handler(message: Message):
+    if not await check_developer(message): return
+    msg = "👥 Список пользователей с доступом к боту:\n\n"
+    all_ids = DEVELOPER_IDS + CONFIG['access_list']
+    if not all_ids: return await message.answer(msg + "Список пуст.")
+    users_info = await bot.api.users.get(user_ids=all_ids)
+    for user in users_info:
+        status = "Разработчик" if user.id in DEVELOPER_IDS else "Администратор"
+        msg += f"▪ [id{user.id}|{user.first_name} {user.last_name}] — {status}\n"
+    await message.answer(msg)
+    
+@bot.on.message()
+async def default_handler(message: Message):
+    if message.peer_id == CONFIG.get('target_chat_id', 0) and "Список пользователей с никами:" in message.text:
+        parsed_nicks = parse_nicknames_from_message(message.text)
+        if parsed_nicks:
+            await process_and_notify(parsed_nicks)
+
+async def on_startup():
+    load_config()
+    logger.info("Bot started!")
+    asyncio.create_task(hourly_sync_task())
+
+if __name__ == "__main__":
+    bot.loop_wrapper.add_task(on_startup())
+    bot.run_forever()
